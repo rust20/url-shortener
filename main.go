@@ -1,10 +1,14 @@
 package main
 
 import (
+	"database/sql"
 	"fmt"
 	"log"
 	"net/http"
 	netURL "net/url"
+
+	_ "github.com/mattn/go-sqlite3"
+	"gitlab.db.in.tum.de/rust20/url-shortener/raft"
 
 	"crypto/md5"
 	"encoding/base64"
@@ -19,11 +23,22 @@ var ErrInvalidRequest = fmt.Errorf("request is invalid")
 
 const ID_LENGHT = 8
 const MAX_URL_LENGTH = 1024
+const DB_FILE = "store.db"
+
+type serverOp int
+
+const (
+	SOpAdd serverOp = iota
+	SOpDel
+)
 
 type server struct {
+	dbConn   *sql.DB
 	urlToId  map[string]string
 	idToUrl  map[string]string
 	idLength int32
+
+	raftServer *raft.State
 }
 
 type ShortURLResponse struct {
@@ -34,26 +49,28 @@ type ShortURLResponse struct {
 }
 
 func (s *server) handler(w http.ResponseWriter, req *http.Request) {
-	log.Printf("[+] path: %s | meth: %s\n", req.URL.Path, req.Method)
+	log.Printf("[+] path: %s | method: %s\n", req.URL.Path, req.Method)
 	w.Header().Set("Content-Type", "application/json")
+
+	// TODO: redirect if not leader
 
 	if req.Method == "POST" {
 		req.ParseForm()
 		urls, ok := req.PostForm["url"]
 		if !ok || len(urls) == 0 {
 			log.Println("invalid request")
-			handleBadRequestError(w, ErrInvalidRequest.Error())
+			http.Error(w, ErrInvalidRequest.Error(), http.StatusBadRequest)
 			return
 		}
 		url := urls[0]
 		if !validateURL(url) {
 			log.Println("invalid url")
-			handleBadRequestError(w, ErrInvalidURL.Error())
+			http.Error(w, ErrInvalidURL.Error(), http.StatusBadRequest)
 			return
 		}
 		res, err := s.CreateShortURL(url)
 		if err != nil {
-			handleBadRequestError(w, err.Error())
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
@@ -68,59 +85,27 @@ func (s *server) handler(w http.ResponseWriter, req *http.Request) {
 
 		responseJson, err := json.Marshal(response)
 		if err != nil {
-			handleInternalServerError(w, err.Error())
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
 		w.Write(responseJson)
 		return
 
 	} else if req.Method == "GET" {
 		if len(req.URL.Path) < 1 {
-			handleBadRequestError(w, ErrInvalidRequest.Error())
+			http.Error(w, ErrInvalidRequest.Error(), http.StatusBadRequest)
 			return
 		}
 
 		url_id := req.URL.Path[1:]
 		url, err := s.GetShortURL(url_id)
 		if err != nil {
-			handleBadRequestError(w, err.Error())
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
 		http.Redirect(w, req, url, http.StatusSeeOther)
-
-		// response := ShortURLResponse{
-		// 	Status:   http.StatusAccepted,
-		// 	URL: url,
-		// 	Message:  "success",
-		// }
-		//
-		//       responseJson, err := json.Marshal(response)
-		//       if err != nil {
-		//           handleInternalServerError(w, err.Error())
-		//       }
-		//       w.Write(responseJson)
-
 		return
 	}
-}
-
-func handleInternalServerError(w http.ResponseWriter, message string) {
-	handleError(w, message, http.StatusInternalServerError)
-}
-
-func handleBadRequestError(w http.ResponseWriter, message string) {
-	handleError(w, message, http.StatusBadRequest)
-}
-
-func handleError(w http.ResponseWriter, message string, status int) {
-	w.WriteHeader(status)
-	resp := make(map[string]string)
-	resp["message"] = message
-	responseJson, err := json.Marshal(resp)
-	if err != nil {
-		log.Fatalf("Error happened in JSON marshal. Err: %s", err)
-	}
-	w.Write(responseJson)
 }
 
 func (s *server) CreateShortURL(url string) (string, error) {
@@ -134,7 +119,21 @@ func (s *server) CreateShortURL(url string) (string, error) {
 	} else {
 		newId := s.HashURL(url)
 		s.urlToId[url] = newId
+		s.idToUrl[newId] = url
 		urlId = newId
+	}
+
+	err := s.raftServer.AddLog(raft.Log{
+		Op:    int(SOpAdd),
+		Key:   urlId,
+		Value: url,
+	})
+	if err != nil {
+		return "", err
+	}
+	err = s.raftServer.BroadcastEntries(false)
+	if err != nil {
+		return "", err
 	}
 
 	return urlId, nil
@@ -151,8 +150,27 @@ func (s *server) HashURL(url string) string {
 	hasher := md5.New()
 	hasher.Write([]byte(url))
 
-    encoded := base64.StdEncoding.EncodeToString(hasher.Sum(nil))
+	encoded := base64.StdEncoding.EncodeToString(hasher.Sum(nil))
 	return encoded[:s.idLength]
+}
+
+func (s *server) InsertShortURL(url_id string, url_full string) {
+    s.urlToId[url_full] = url_id
+    s.idToUrl[url_id] = url_full
+}
+
+func (s *server) ApplyLogs(self *raft.State) {
+	logs := self.Logs[self.LastApplied:self.CommitIndex]
+	for _, log := range logs {
+		url_id := log.Key
+		url_full := log.Value
+		if log.Op == int(SOpAdd) {
+            s.InsertShortURL(url_id, url_full)
+		} else if log.Op == int(SOpDel) {
+			delete(s.urlToId, url_full)
+			delete(s.idToUrl, url_id)
+		}
+	}
 }
 
 func validateURL(url string) bool {
@@ -161,15 +179,30 @@ func validateURL(url string) bool {
 }
 
 func main() {
-	svr := &server{
-		map[string]string{},
-		map[string]string{},
-		ID_LENGHT,
+	dbConn, err := sql.Open("sqlite3", DB_FILE)
+	if err != nil {
+		log.Fatalf("failed to open database connection: %s", err.Error())
 	}
+
+	svr := &server{
+		dbConn:   dbConn,
+		urlToId:  map[string]string{},
+		idToUrl:  map[string]string{},
+		idLength: ID_LENGHT,
+
+		raftServer: nil,
+	}
+
+	raftServer := raft.NewState(dbConn, &raft.NewStateArgs{
+		ApplyLog: svr.ApplyLogs,
+		ElectionTimeout: 0,
+		SelfNode:        raft.Node{},
+	})
+
+	svr.raftServer = raftServer
 
 	http.HandleFunc("/", svr.handler)
 	log.Println("running")
 
 	http.ListenAndServe(":8080", nil)
-
 }
