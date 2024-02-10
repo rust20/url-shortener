@@ -1,0 +1,17 @@
+Nodes:
+  - Name: "node1"
+    Addr: "localhost:8000"
+  - Name: "node2"
+    Addr: "localhost:8001"
+  - Name: "node3"
+    Addr: "localhost:8002"
+  - Name: "node4"
+    Addr: "localhost:8003"
+  - Name: "node5"
+    Addr: "localhost:8004"
+
+HeartbeatInterval: "500ms"
+ElectionTimeoutBase: "1000ms"
+ElectionTimeoutRange: 300
+DBFileName: "database.sqlite3"
+ServerPort: "8080"

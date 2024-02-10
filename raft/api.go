@@ -1,31 +1,40 @@
 package raft
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
 
-	log "github.com/sirupsen/logrus"
+	// log "github.com/sirupsen/logrus"
 )
 
 const RequestVoteAPIPath = "/requestvote"
 const AppendEntriesAPIPath = "/appendentries"
 
 type AppendEntriesResponse struct {
-	Term    uint64 `json:"term"`
-	Success bool   `json:"success"`
+	Term    int  `json:"term"`
+	Success bool `json:"success"`
+}
+
+func (s *State) StartServer() {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("POST /requestvote", s.HandleRequestVote)
+	mux.HandleFunc("POST /appendentries", s.HandleAppendEntries)
+
+	selfNode := s.nodes[s.selfNode]
+
+	err := http.ListenAndServe(selfNode.Addr, mux)
+	if err != nil {
+		clog.Panicf("raft server failed: %s", err.Error())
+	}
 }
 
 func (s *State) HandleAppendEntries(w http.ResponseWriter, req *http.Request) {
-	log.Printf("[!] append entries")
-
-	if req.Method != "POST" {
-		http.Error(w, "invalid method", http.StatusBadRequest)
-		return
-	}
+	clog.Debugf("[!] append entries")
 
 	args := AppendEntriesArgs{}
-
 	err := json.NewDecoder(req.Body).Decode(&args)
 	if err != nil {
 		message := fmt.Sprintf("failed to parse body: %s", err)
@@ -48,17 +57,12 @@ func (s *State) HandleAppendEntries(w http.ResponseWriter, req *http.Request) {
 }
 
 type RequestVoteResponse struct {
-	Term        uint64 `json:"term"`
-	VoteGranted bool   `json:"vote_granted"`
+	Term        int  `json:"term"`
+	VoteGranted bool `json:"vote_granted"`
 }
 
 func (s *State) HandleRequestVote(w http.ResponseWriter, req *http.Request) {
-	log.Info("[!] request vote")
-
-	if req.Method != "POST" {
-		http.Error(w, "invalid method", http.StatusBadRequest)
-		return
-	}
+	clog.Debugf("[!] request vote")
 
 	args := RequestVoteArgs{}
 
@@ -84,10 +88,17 @@ func (s *State) HandleRequestVote(w http.ResponseWriter, req *http.Request) {
 }
 
 func (s *State) SendAppendEntries(target Node, args *AppendEntriesArgs) (*AppendEntriesResponse, error) {
+	clog.Debugf("[>>] send append entries")
 	// TODO: impl retry mechanism
 
-	targetURL := fmt.Sprintf("%s:%d%s", target.Address, target.Port, AppendEntriesAPIPath)
-	req, err := http.NewRequest(http.MethodPost, targetURL, nil)
+	jsonBody, err := json.Marshal(args)
+	if err != nil {
+		return nil, err
+	}
+
+	targetURL := fmt.Sprintf("http://%s%s", target.Addr, AppendEntriesAPIPath)
+	req, err := http.NewRequest(http.MethodPost, targetURL, bytes.NewBuffer(jsonBody))
+	req.Header.Set("Content-Type", "application/json; charset=UTF-8")
 
 	if err != nil {
 		return nil, err
@@ -108,95 +119,39 @@ func (s *State) SendAppendEntries(target Node, args *AppendEntriesArgs) (*Append
 }
 
 func (s *State) SendRequestVote(target Node, args *RequestVoteArgs) (*RequestVoteResponse, error) {
+	clog.Debugf("[>>] send request vote")
 	// TODO: impl retry mechanism
 
-	targetURL := fmt.Sprintf("%s:%d%s", target.Address, target.Port, RequestVoteAPIPath)
-	req, err := http.NewRequest(http.MethodPost, targetURL, nil)
+	jsonBody, err := json.Marshal(args)
 	if err != nil {
+		return nil, err
+	}
+
+	targetURL := fmt.Sprintf("http://%s%s", target.Addr, RequestVoteAPIPath)
+	req, err := http.NewRequest(http.MethodPost, targetURL, bytes.NewBuffer(jsonBody))
+	req.Header.Set("Content-Type", "application/json; charset=UTF-8")
+
+	if err != nil {
+		clog.Debug("wawawa")
 		return nil, err
 	}
 
 	reqResp, err := http.DefaultClient.Do(req)
 	if err != nil {
+		clog.Debug("wawi1")
 		return nil, err
 	}
 
+	// content, _ := io.ReadAll(reqResp.Body)
+	//
+	// log.Debug("raw contnet", string(content))
+	//
 	resp := &RequestVoteResponse{}
 	err = json.NewDecoder(reqResp.Body).Decode(resp)
 	if err != nil {
+		clog.Debug("wawi2")
 		return nil, err
 	}
 
 	return resp, nil
-}
-
-func (s *State) AddLog(log Log) error {
-	s.LogsMu.Lock()
-	defer s.LogsMu.Unlock()
-
-    log.Term = s.CurrentTerm
-    log.Idx = s.logLength()
-
-    s.Logs = append(s.Logs, log)
-    // TODO: append in db as well
-
-    return nil
-}
-
-func (s *State) BroadcastEntries(isHeartbeat bool) error {
-    // TODO: maybe add somekind of buffer?
-
-	s.LogsMu.Lock()
-	defer s.LogsMu.Unlock()
-
-    logLength := s.logLength()
-
-	for i, node := range s.nodes {
-		if node == s.selfNode {
-			continue
-		}
-
-		nextIdx := s.NextIndex[i]
-		args := &AppendEntriesArgs{
-			Term:     s.CurrentTerm,
-			LeaderId: s.selfNode,
-
-			PrevLogIndex: nextIdx - 1,
-			PrevLogTerm:  s.Logs[nextIdx - 1].Term,
-
-			Entries:      s.Logs,
-			LeaderCommit: s.CommitIndex,
-		}
-
-		if !isHeartbeat {
-			// TODO: change to fetch logs from db(?)
-			// res, err := s.GetLogs(int(s.NextIndex[i]), int(s.logLength() - s.logLength()))
-			res := s.Logs[nextIdx:logLength]
-			args.Entries = res
-		}
-
-		// TODO: make retryable
-		// TODO: do this in a goroutine
-		resp, err := s.SendAppendEntries(node, args)
-        // TODO: retry if unreachable
-		if err != nil {
-			return err
-		}
-
-		if resp.Term > s.CurrentTerm {
-			s.ToFollower()
-			return nil
-		}
-
-		if isHeartbeat {
-			return nil
-		}
-
-		if resp.Success {
-			s.NextIndex[i] = logLength
-			s.MatchIndex[i] = logLength
-		}
-	}
-
-	return nil
 }

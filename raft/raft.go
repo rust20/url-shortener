@@ -2,24 +2,31 @@ package raft
 
 import (
 	"database/sql"
+	"fmt"
+	"math/rand"
 	"sync"
 	"time"
 
 	"errors"
 
+	"github.com/jmoiron/sqlx"
 	log "github.com/sirupsen/logrus"
+	"gitlab.db.in.tum.de/rust20/url-shortener/config"
 )
 
 const RETRY_COUNT = 3
 
+var ErrAppendEntriesFail = errors.New("append failed")
+
 var signal = struct{}{}
 
 type Log struct {
-	Term  uint64 `json:"term"`
-	Idx   uint64 `json:"idx"`
-	Op    int    `json:"op"`
-	Key   string `json:"key"`
-	Value string `json:"val"`
+	Id    int    `json:"-" db:"log_id"`
+	Term  int    `json:"term" db:"log_term"`
+	Idx   int    `json:"idx" db:"log_idx"`
+	Op    int    `json:"op" db:"op"`
+	Key   string `json:"key" db:"strkey"`
+	Value string `json:"val" db:"strval"`
 }
 
 type NodeStatus int
@@ -31,9 +38,9 @@ const (
 )
 
 type Node struct {
-	Address string
-	Port    int
-	Status  NodeStatus
+	// ID     int
+	Addr   string `db:"address"`
+	Status NodeStatus
 }
 
 type ModeState int
@@ -44,28 +51,31 @@ const (
 	ModeCandidate
 )
 
-type leaderData struct {
-}
-
 type State struct {
-	mode ModeState
+	mode   ModeState
+	ModeMu sync.Mutex
+
 	// general persistent state
 	// update before respond to rpcs
-	// TODO: store in db
-	CurrentTerm uint64
-	VotedFor    *Node
-	Logs        []Log
-	LogsMu      sync.Mutex
+	Term     int
+	TermMu   sync.Mutex // TODO: use mutex
+	VotedFor *Node
+	VoteMu   sync.Mutex // TODO: use mutex
+	LogsMu   sync.Mutex
 
 	// general volatile state
-	CommitIndex uint64
-	LastApplied uint64
+	CommitIndex int
+	CommitMu    sync.Mutex // TODO: use mutex
+	LastApplied int
+	AppliedMu   sync.Mutex // TODO: use mutex
 
 	// leader's volatile state
 	// reset after elections
 
-	NextIndex  []uint64
-	MatchIndex []uint64
+	NextIndex  []int
+	NIndexMu   sync.Mutex // TODO: use mutex
+	MatchIndex []int
+	MIndexMu   sync.Mutex // TODO: use mutex
 
 	ApplyLogCallback func(self *State)
 
@@ -77,55 +87,113 @@ type State struct {
 	stopHeartbeatBroadcast chan<- any
 
 	nodes    []Node
-	selfNode Node
+	nodesMu  sync.Mutex // TODO: use mutex
+	selfNode int
+
+	db      *database
+	prevIdx int
 }
 
 type NewStateArgs struct {
 	ApplyLog          func(self *State)
 	ElectionTimeout   time.Duration
-	heartbeatInterval time.Duration
-	SelfNode          Node
+	HeartbeatInterval time.Duration
+	SelfNode          int
+	Config            config.Config
 }
 
-func NewState(db *sql.DB, args *NewStateArgs) *State {
+var clog *log.Entry
+
+func New(db *sqlx.DB, args *NewStateArgs) *State {
+    clog = log.WithField("node", args.SelfNode)
+
+	timeoutOffset := time.Duration(rand.Intn(args.Config.ElectionTimeoutRange)) * time.Millisecond
+
+	clog.Info("timout offset -> ", timeoutOffset)
+	time.Sleep(2 * time.Second)
+
+	electionTimeout := args.Config.ElectionTimeoutBase + timeoutOffset
+
+	conn := &database{db}
+
+	nodes, err := conn.GetNodes()
+	if err != nil {
+		clog.Panicf("raft: failed to get nodes: %v", err)
+	}
+
+	for _, node := range args.Config.Nodes {
+		nodes = append(nodes, Node{
+			Addr: node.Addr,
+			// Status:  ,
+		})
+	}
+
+	// TODO: update term
+	term, err := conn.GetValInt("term")
+	if err == sql.ErrNoRows {
+		term = 0
+	} else if err != nil {
+		clog.Panicf("raft: failed to get term from db: %v", err)
+	}
+
+	// TODO: update voted for
+	var votedFor *Node = nil
+	votedForAddr, _ := conn.GetValString("votedFor")
+
+	if err == sql.ErrNoRows {
+		votedForAddr = ""
+	} else if err != nil {
+		clog.Panicf("raft: failed to get votedfor from db: %v", err)
+	}
+
+	if votedForAddr != "" {
+		votedFor = &Node{Addr: votedForAddr}
+	}
+
 	return &State{
-		mode:        ModeFollower,
-		CurrentTerm: 0,
-		VotedFor:    nil,
-		Logs:        []Log{},
+		mode:     ModeFollower,
+		Term:     term,
+		VotedFor: votedFor,
+		LogsMu:   sync.Mutex{},
 
-		CommitIndex: 0,
-		LastApplied: 0,
+		CommitIndex: -1,
+		LastApplied: -1,
+		NextIndex:   []int{},
+		MatchIndex:  []int{},
 
-		NextIndex:  []uint64{},
-		MatchIndex: []uint64{},
-
-		ApplyLogCallback:     args.ApplyLog,
-		electionTimeout:      0,
-		resetElectionTimeout: make(chan<- any),
-		stopElectionTimer:    make(chan<- any),
-
-		heartbeatInterval:      0,
+		ApplyLogCallback:       args.ApplyLog,
+		electionTimeout:        electionTimeout,
+		resetElectionTimeout:   make(chan<- any),
+		stopElectionTimer:      make(chan<- any),
+		heartbeatInterval:      args.HeartbeatInterval,
 		stopHeartbeatBroadcast: make(chan<- any),
+		nodes:                  nodes,
+		selfNode:               args.SelfNode,
 
-		nodes:    []Node{},
-		selfNode: Node{},
+		db: conn,
 	}
 }
 
+func (s *State) Run() {
+	s.ToFollower()
+	s.StartServer()
+}
+
 type AppendEntriesArgs struct {
-	Term         uint64 `json:"term"`
-	LeaderId     Node   `json:"leader_id"`
-	PrevLogIndex uint64 `json:"prev_log_idx"`
-	PrevLogTerm  uint64 `json:"prev_log_term"`
-	Entries      []Log  `json:"entries"`
-	LeaderCommit uint64 `json:"leader_commit"`
+	Term         int   `json:"term"`
+	LeaderId     Node  `json:"leader_id"`
+	PrevLogIndex int   `json:"prev_log_idx"`
+	PrevLogTerm  int   `json:"prev_log_term"`
+	Entries      []Log `json:"entries"`
+	LeaderCommit int   `json:"leader_commit"`
 }
 
-func (s *State) logLength() uint64 {
-	return uint64(len(s.Logs))
+// Not thread safe.
+func (s *State) logLength() (int, error) {
+	return s.db.LogsLength()
 }
 
+// Is thread safe.
 func (s *State) startElectionTimer() (chan<- any, chan<- any) {
 	reset := make(chan any)
 	stop := make(chan any)
@@ -136,9 +204,9 @@ func (s *State) startElectionTimer() (chan<- any, chan<- any) {
 			case <-stop:
 				break
 			case <-reset:
-				// TODO: do things when reset (probably nothing)
+				// do nothing
 			case <-time.After(s.electionTimeout):
-				s.ToCandidate()
+				go s.ToCandidate()
 			}
 		}
 	}()
@@ -146,7 +214,9 @@ func (s *State) startElectionTimer() (chan<- any, chan<- any) {
 	return reset, stop
 }
 
+// Is thread safe.
 func (s *State) startHeartbeatBroadcaster() chan<- any {
+    clog.Info("BROADCASTING YOOOO")
 	stop := make(chan any)
 
 	go func() {
@@ -155,7 +225,7 @@ func (s *State) startHeartbeatBroadcaster() chan<- any {
 			case <-stop:
 				break
 			case <-time.After(s.heartbeatInterval):
-                s.BroadcastEntries(true)
+				go s.BroadcastEntries(true)
 			}
 		}
 	}()
@@ -163,12 +233,12 @@ func (s *State) startHeartbeatBroadcaster() chan<- any {
 	return stop
 }
 
-var ErrAppendEntriesFail = errors.New("append failed")
-
 // invoked by leader
-func (s *State) AppendEntries(args AppendEntriesArgs) (uint64, bool) {
-	if args.Term < s.CurrentTerm {
+// Is thread safe.
+func (s *State) AppendEntries(args AppendEntriesArgs) (int, bool) {
+	if args.Term > s.Term {
 		if s.mode == ModeLeader {
+			s.Term = args.Term
 			s.ToFollower()
 		}
 	}
@@ -176,21 +246,55 @@ func (s *State) AppendEntries(args AppendEntriesArgs) (uint64, bool) {
 	s.resetElectionTimeout <- signal
 	s.LogsMu.Lock()
 
-	if s.logLength() < args.PrevLogIndex || s.Logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+	logLength, err := s.logLength()
+	if err != nil {
 		s.LogsMu.Unlock()
-		return s.CurrentTerm, false
+		clog.Panicf("raft: failed to get log length")
 	}
 
-	// TODO: maybe checking from the latest entries would be faster?
-	// TODO: binary search could world aswell for large number of entries
-	for _, entry := range args.Entries {
-		if entry.Term != s.Logs[entry.Idx].Term {
-			s.Logs = s.Logs[:entry.Idx]
+	if logLength < args.PrevLogIndex {
+		s.LogsMu.Unlock()
+		return s.Term, false
+	}
+
+	prevLog, err := s.db.GetLogByIdx(args.PrevLogIndex)
+	if err != nil {
+		s.LogsMu.Unlock()
+		clog.Panicf("raft: failed to get log length: %s", err.Error())
+	}
+
+	if prevLog.Term != args.PrevLogTerm {
+		s.LogsMu.Unlock()
+		return s.Term, false
+	}
+
+	if len(args.Entries) == 0 {
+		// TODO: maybe just return??
+	}
+
+	logs, err := s.db.ListLogs(args.PrevLogIndex+1, len(args.Entries))
+
+	deleteFrom := 0
+
+	for i, entry := range args.Entries {
+		if entry.Term != logs[entry.Idx-args.PrevLogIndex].Term {
+			deleteFrom = i
 			break
 		}
 	}
 
-	s.Logs = append(s.Logs, args.Entries...)
+	err = s.db.DeleteLogs(args.Entries[deleteFrom].Idx)
+	if err != nil {
+		s.LogsMu.Unlock()
+		clog.Panicf("raft: failed to delete log: %s", err.Error())
+	}
+
+	err = s.db.InsertLogs(args.Entries[deleteFrom:])
+	if err != nil {
+		s.LogsMu.Unlock()
+		clog.Panicf("raft: failed to append log: %s", err.Error())
+	}
+
 	s.LogsMu.Unlock()
 
 	if args.LeaderCommit > s.CommitIndex {
@@ -201,35 +305,44 @@ func (s *State) AppendEntries(args AppendEntriesArgs) (uint64, bool) {
 		s.LastApplied = s.CommitIndex
 	}
 
-	return s.CurrentTerm, true
+	return s.Term, true
 }
 
 type RequestVoteArgs struct {
-	Term         uint64 `json:"term"`
-	CandidateId  Node   `json:"candidate_id"`
-	LastLogIndex uint64 `json:"last_log_idx"`
-	LastLogTerm  uint64 `json:"last_log_term"`
+	Term         int  `json:"term"`
+	CandidateId  Node `json:"candidate_id"`
+	LastLogIndex int  `json:"last_log_idx"`
+	LastLogTerm  int  `json:"last_log_term"`
 }
 
 // invoked by candiates
-func (s *State) RequestVote(args RequestVoteArgs) (uint64, bool) {
-	if args.Term < s.CurrentTerm {
-		return s.CurrentTerm, false
+// Is thread safe.
+func (s *State) RequestVote(args RequestVoteArgs) (int, bool) {
+	if args.Term < s.Term {
+		return s.Term, false
 	}
 
-	// TODO: if is leader/candidate with < term, immediately change to follower
-
 	s.resetElectionTimeout <- signal
-	s.LogsMu.Lock()
-	defer s.LogsMu.Unlock()
+	// s.LogsMu.Lock()
+	logLength, err := s.logLength()
+	if err != nil {
+		clog.Panicf("raft: vote request failed: failed to get log length: %s", err.Error())
+	}
+	logIndex := logLength - 1
+
+	// s.LogsMu.Unlock()
 
 	grantVote := (s.VotedFor == nil || *s.VotedFor == args.CandidateId) &&
-		(args.Term >= s.CurrentTerm && args.LastLogIndex >= s.logLength())
+		(args.Term >= s.Term && args.LastLogIndex >= logIndex)
 
-	return s.CurrentTerm, grantVote
+	s.VotedFor = &args.CandidateId
+
+	return s.Term, grantVote
 }
 
+// Is thread safe.
 func (s *State) ToFollower() {
+	clog.Info("[+] is now a follower")
 	s.mode = ModeFollower
 
 	select {
@@ -238,97 +351,79 @@ func (s *State) ToFollower() {
 	default:
 		// message dropped, probably its closed because no thing is running
 	}
+    // close(s.stopHeartbeatBroadcast)
 
 	resetChan, stopChan := s.startElectionTimer()
 	s.resetElectionTimeout = resetChan
 	s.stopElectionTimer = stopChan
 }
 
+// Is thread safe.
 func (s *State) ToCandidate() {
+	clog.Info("[+] starting election")
 	s.mode = ModeCandidate
-	s.CurrentTerm += 1
-	s.VotedFor = &s.selfNode
+	s.Term += 1
+	s.VotedFor = &s.nodes[s.selfNode]
 
 	s.resetElectionTimeout <- signal
 
-	// voteChannel := make(chan int)
-	// gotNewLeader := make(chan any)
 	acquiredVotes := 0
 
 	s.LogsMu.Lock()
 	defer s.LogsMu.Unlock()
 
-	for _, node := range s.nodes {
-		lastLogterm := uint64(0)
+	selfNode := s.nodes[s.selfNode]
 
-		if s.logLength() > 0 {
-			lastLogterm = s.Logs[s.logLength()].Term
-		}
+	lastLog, err := s.db.GetLastLog()
 
-		payload := &RequestVoteArgs{
-			Term:         s.CurrentTerm,
-			CandidateId:  s.selfNode,
-			LastLogIndex: s.logLength(),
-			LastLogTerm:  lastLogterm,
-		}
-
-		// TODO: pass to goroutine
-		// var wg sync.WaitGroup
-		//
-		// go func() {
-		// 	wg.Add(1)
-		// 	defer wg.Done()
-		//
-		// 	for i := 0; ; i += 1 {
-		// 		resp, err := s.SendRequestVote(node, payload)
-		// 		if err == nil {
-		// 			if resp.Term > s.CurrentTerm {
-		// 				gotNewLeader <- signal
-		// 				s.ToFollower()
-		// 				break
-		// 			}
-		// 			if resp.VoteGranted {
-		// 				voteChannel <- 1
-		// 			} else {
-		// 				voteChannel <- 0
-		// 			}
-		// 			break
-		// 		}
-		// 		time.Sleep(time.Duration(i*100) * time.Millisecond)
-		// 	}
-		// }()
-		resp, err := s.SendRequestVote(node, payload)
-		if err != nil {
-			log.Errorf("failed to send request vote %v", err)
-		}
-		if resp.Term > s.CurrentTerm {
-			// TODO: when impl for concurrency, 
-            //       move this after the for loop
-			s.ToFollower()
-            return
-		}
-		if resp.VoteGranted {
-			acquiredVotes += 1
-			// 	acquiredVotes <- 1
-			// } else {
-			// 	acquiredVotes <- 0
-		}
+	if err == sql.ErrNoRows {
+		lastLog = &Log{}
+	} else if err != nil {
+		clog.Panicf("raft: candidate process failed: failed to get log length: %s", err.Error())
 	}
 
-	// for i := 0; i < len(s.nodes); i += 1 {
-	// 	acquiredVotes += <-voteChannel
-	// }
+	payload := &RequestVoteArgs{
+		Term:         s.Term,
+		CandidateId:  selfNode,
+		LastLogIndex: lastLog.Idx,
+		LastLogTerm:  lastLog.Term,
+	}
+
+	for i, node := range s.nodes {
+		if i == s.selfNode {
+			continue
+		}
+
+		resp, err := s.SendRequestVote(node, payload)
+		if err != nil {
+			clog.Error("failed to send request vote: ", err)
+			continue
+		}
+		if resp.Term > s.Term {
+			s.ToFollower()
+			return
+		}
+		if resp.VoteGranted {
+            clog.Debug("vote acc")
+			acquiredVotes += 1
+		} else {
+            clog.Debug("vote rejected")
+        }
+	}
 
 	if hasMajorityVote(acquiredVotes, len(s.nodes)) {
 		s.ToLeader()
 	}
 }
 
-func hasMajorityVote(vote int, total int) bool {
-	return vote > (total - vote)
-}
-
+// ToLeader will:
+// - disable service redirection,
+// - disable election timer,
+// - enable heartbeat broadcaster
+// - reset []NextIndex and []MatchIndex
+// Is thread safe.
 func (s *State) ToLeader() {
+	clog.Info("[+] is now a leader")
 	s.mode = ModeLeader
 	select {
 	case s.stopElectionTimer <- signal:
@@ -336,26 +431,140 @@ func (s *State) ToLeader() {
 	default:
 		// message dropped, probably its closed
 	}
-	close(s.stopElectionTimer)
-	close(s.resetElectionTimeout)
+	// close(s.stopElectionTimer)
+	// close(s.resetElectionTimeout)
 
 	stopChan := s.startHeartbeatBroadcaster()
 	s.stopHeartbeatBroadcast = stopChan
 
-	s.NextIndex = make([]uint64, len(s.nodes))
-	s.MatchIndex = make([]uint64, len(s.nodes))
+	s.NextIndex = make([]int, len(s.nodes))
+	s.MatchIndex = make([]int, len(s.nodes))
 
 	s.LogsMu.Lock()
 	defer s.LogsMu.Unlock()
 
-	lastLogIndex := s.logLength()
-	for i := 0; i < len(s.nodes); i += 1 {
-		s.NextIndex[i] = lastLogIndex
+	logLength, err := s.logLength()
+	if err != nil {
+		clog.Panicf("raft: initiating leader failed: failed to get log length: %s", err.Error())
+	}
+
+	for i := range len(s.nodes) {
+		s.NextIndex[i] = logLength
+		s.MatchIndex[i] = -1
 	}
 }
 
-// GetLogs will get list of logs from memory. Not thread safe.
+// GetLogs will get list of logs from memory.
+// Not thread safe.
 func (s *State) GetLogs(start int, count int) ([]Log, error) {
-    l := s.Logs[start:start+count]
-    return l, nil
+	// l := s.Logs[start : start+count]
+	l, err := s.db.ListLogs(start, count)
+	if err != nil {
+		return nil, err
+	}
+	return l, nil
+}
+
+func hasMajorityVote(vote int, total int) bool {
+	return vote > (total - vote)
+}
+
+func (s *State) BroadcastEntries(isHeartbeat bool) error {
+
+	s.LogsMu.Lock()
+	defer s.LogsMu.Unlock()
+
+	logLength, err := s.logLength()
+	if err != nil {
+		return fmt.Errorf("raft: broadcast entries failed: failed to get log length: %s", err.Error())
+	}
+
+	leader := s.nodes[s.selfNode]
+	for i, node := range s.nodes {
+
+		if i == s.selfNode {
+			continue
+		}
+
+		nextIdx := s.NextIndex[i]
+		args := &AppendEntriesArgs{
+			Term:     s.Term,
+			LeaderId: leader,
+
+			PrevLogIndex: nextIdx - 1,
+			PrevLogTerm:  0,
+
+			Entries:      nil,
+			LeaderCommit: s.CommitIndex,
+		}
+
+		for {
+			if !isHeartbeat {
+				nextIdx = s.NextIndex[i]
+				res, err := s.GetLogs(nextIdx-1, logLength-nextIdx)
+				if err != nil {
+					return err
+				}
+
+				args.PrevLogTerm = res[0].Term
+				args.Entries = res[1:]
+			}
+
+			resp, err := s.SendAppendEntries(node, args)
+			if err != nil {
+				return err
+			}
+
+			if resp.Term > s.Term {
+				s.ToFollower()
+				return nil
+			}
+
+			if isHeartbeat {
+				return nil
+			}
+
+			if resp.Success {
+				s.NextIndex[i] = logLength
+				s.MatchIndex[i] = logLength
+				break
+			}
+
+			s.NextIndex[i] -= 1
+		}
+	}
+
+	maxVal := 0
+	for _, val := range s.MatchIndex {
+		if maxVal < val {
+			maxVal = val
+		}
+	}
+
+	for val := maxVal; val > s.CommitIndex; val -= 1 {
+		if val <= s.CommitIndex {
+			continue
+		}
+		logData, err := s.db.GetLogByIdx(val)
+		if err != nil {
+			return err
+		}
+		if logData.Term != s.Term {
+			continue
+		}
+
+		countTrue := 0
+		for _, val2 := range s.MatchIndex {
+			if val2 >= val {
+				countTrue += 1
+			}
+		}
+
+		if countTrue > (len(s.MatchIndex) - countTrue) {
+			s.CommitIndex = val
+			break
+		}
+	}
+
+	return nil
 }
