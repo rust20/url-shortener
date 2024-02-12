@@ -11,7 +11,7 @@ Nodes:
     Addr: "localhost:8004"
 
 HeartbeatInterval: "500ms"
-ElectionTimeoutBase: "1000ms"
-ElectionTimeoutRange: 300
+ElectionTimeoutBase: "2000ms"
+ElectionTimeoutRange: 10
 DBFileName: "database.sqlite3"
 ServerPort: "8080"

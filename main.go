@@ -1,12 +1,12 @@
 package main
 
 import (
+	"database/sql"
 	"flag"
 	"fmt"
 	"net/http"
 	netURL "net/url"
 	"sync"
-	"time"
 
 	"github.com/jmoiron/sqlx"
 	_ "github.com/mattn/go-sqlite3"
@@ -34,8 +34,8 @@ const CheckInvalidURL = false
 type serverOp int
 
 const (
-	SOpAdd serverOp = iota
-	SOpDel
+	OpInsert serverOp = iota
+	OpDelete
 )
 
 type server struct {
@@ -138,11 +138,13 @@ func (s *server) postHandler(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	err = s.raftServer.BroadcastEntries(false)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
+	// TODO: insert log
+
+	// err = s.raftServer.BroadcastEntries()
+	// if err != nil {
+	// 	http.Error(w, err.Error(), http.StatusBadRequest)
+	// 	return
+	// }
 
 	// s.idToUrl[res] = url
 	// s.urlToId[url] = res
@@ -161,34 +163,34 @@ func (s *server) postHandler(w http.ResponseWriter, req *http.Request) {
 	return
 }
 
-func (s *server) CreateShortURL(url string) (string, error) {
-	if len(url) > MAX_URL_LENGTH {
+func (s *server) CreateShortURL(urlFull string) (string, error) {
+	if len(urlFull) > MAX_URL_LENGTH {
 		return "", ErrURLTooLong
 	}
 
-	urlId := ""
+	urlId, err := s.db.GetShortURL(urlFull)
+	if err != nil && err != sql.ErrNoRows {
+		return "", nil
+	}
 
-	// if val, ok := s.urlToId[url]; ok {
-	// 	urlId = val
-	// } else {
-	// 	newId := s.HashURL(url)
-	// 	// s.urlToId[url] = newId
-	// 	// s.idToUrl[newId] = url
-	// 	urlId = newId
-	// }
+	if urlId != "" {
+		return urlId, nil
+	}
 
-	// err := s.raftServer.AddLog(raft.Log{
-	// 	Op:    int(SOpAdd),
-	// 	Key:   urlId,
-	// 	Value: url,
-	// })
-	// if err != nil {
-	// 	return "", err
-	// }
-	// err = s.raftServer.BroadcastEntries(false)
-	// if err != nil {
-	// 	return "", err
-	// }
+	urlId = s.HashURL(urlFull)
+	err = s.db.InsertShortURL(urlId, urlFull)
+	if err != nil {
+		return "", err
+	}
+
+	err = s.raftServer.InsertLog(raft.Log{
+		Op:    int(OpInsert),
+		Key:   urlId,
+		Value: urlFull,
+	})
+	if err != nil {
+		return "", err
+	}
 
 	return urlId, nil
 }
@@ -202,22 +204,21 @@ func (s *server) HashURL(url string) string {
 }
 
 func (s *server) ApplyLogs(self *raft.State) {
-	// TODO: fix
-	// logs := self.Logs[self.LastApplied:self.CommitIndex]
-
 	logs, err := self.GetLogs(self.LastApplied, self.CommitIndex-self.LastApplied)
 	if err != nil {
 		log.Panicf("raft: apply log fail, unable to get logs: %s", err.Error())
 	}
+
 	for _, dataLog := range logs {
 		url_id := dataLog.Key
 		url_full := dataLog.Value
-		if dataLog.Op == int(SOpAdd) {
+		if dataLog.Op == int(OpInsert) {
 			err := s.db.InsertShortURL(url_id, url_full)
 			if err != nil {
 				log.Panicf("server error inserting: %s", err.Error())
 			}
-		} else if dataLog.Op == int(SOpDel) {
+
+		} else if dataLog.Op == int(OpDelete) {
 			err := s.db.DeleteShortURL(url_id)
 			if err != nil {
 				log.Panicf("server error deleting: %s", err.Error())
@@ -234,56 +235,38 @@ func validateURL(url string) bool {
 type CommandArgs struct {
 	ConfigName string
 
-	Self  int
-	Nodes config.ServerConfig // probably dont need this, since the
-
-	HeartbeatInterval    time.Duration
-	ElectionTimeoutBase  int
-	ElectionTimeoutRange int
-
-    RestServer string
-
-	dbPrefix string
-	dbSuffix string
+	Self       int
+	RestServer string
+	dbFileName string
+	dbSuffix   string
 }
 
 func InitCommandArgs() CommandArgs {
 	cmdArgs := CommandArgs{}
 
-	flag.StringVar(&cmdArgs.ConfigName, "c", "config.yaml", "config file name")
-
-	// flag.StringVar(&cmdArgs.Self.Addr, "raft-addr", "127.0.0.1", "address of current server") // TODO: get automatically
-	// flag.StringVar(&cmdArgs.Self.Port, "raft-port", "1337", "port of raft server")            // TODO: get automatically
 	flag.IntVar(&cmdArgs.Self, "self-id", 0, "index of current id from list of nodes defined in config")
 
-
-	flag.DurationVar(&cmdArgs.HeartbeatInterval, "hb", 500*time.Millisecond, "heartbeat interval duration value")
-	flag.IntVar(&cmdArgs.ElectionTimeoutBase, "et-base", 500, "base value of election timeout")
-	flag.IntVar(&cmdArgs.ElectionTimeoutRange, "et-range", 300, "range value of randomized election timeout")
-
-	// TODO: check that the election timeout have to be longer than heartbeat interval
-
-	flag.StringVar(&cmdArgs.dbPrefix, "dbprefix", DB_FILE, "path to sqlite3 database file")
-	flag.StringVar(&cmdArgs.dbSuffix, "dbsuffix", "", "sqlite3 database file suffix")
-    flag.StringVar(&cmdArgs.RestServer, "a", "", "port address for rest server")
+	flag.StringVar(&cmdArgs.ConfigName, "c", "config.yaml", "config file name")
+	flag.StringVar(&cmdArgs.dbFileName, "dbprefix", DB_FILE, "path to sqlite3 database file")
+	flag.StringVar(&cmdArgs.RestServer, "a", "", "port address for rest server")
 
 	flag.Parse()
-
-    time.Sleep(3 * time.Second)
 
 	return cmdArgs
 }
 
 func main() {
 	log.SetLevel(log.DebugLevel)
+	log.SetFormatter(&log.TextFormatter{
+		ForceColors: true,
+		ForceQuote:  true,
+	})
 
 	cmdArgs := InitCommandArgs()
 
 	cfg := config.GetConfig(cmdArgs.ConfigName)
 
-	log.Debugf("config: %v", cfg)
-
-	dbConn, err := sqlx.Connect("sqlite3", cfg.DBFileName)
+	dbConn, err := sqlx.Connect("sqlite3", cmdArgs.dbFileName)
 	if err != nil {
 		log.Fatalf("failed to open database connection: %s", err.Error())
 	}
@@ -302,7 +285,8 @@ func main() {
 	raftServer := raft.New(dbConn, &raft.NewStateArgs{
 		ApplyLog: svr.ApplyLogs,
 		SelfNode: cmdArgs.Self,
-		Config:   cfg,
+
+		Config: cfg,
 	})
 
 	svr.raftServer = raftServer

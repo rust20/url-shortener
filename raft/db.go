@@ -38,8 +38,12 @@ func (d *database) InsertLogs(logs []Log) error {
 		return err
 	}
 
+	query := "" +
+		"INSERT INTO Node(log_id, log_term, log_idx, op, strkey, strval) " +
+		"values(:idx, :term, :idx, :opr, :key, :val)"
+
 	for _, log := range logs {
-		result, err := tx.NamedExec("INSERT INTO Node(log_id, log_term, log_idx, op, strkey, strval) values(:idx, :term, :idx, :opr, :key, :val)",
+		result, err := tx.NamedExec(query,
 			map[string]interface{}{
 				"idx":  log.Idx,
 				"term": log.Term,
@@ -104,6 +108,11 @@ func (d *database) GetLogByIdx(idx int) (*Log, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	if len(res) == 0 {
+		return nil, nil
+	}
+
 	return &res[0], nil
 }
 
@@ -142,7 +151,7 @@ func (d *database) GetNodes() ([]Node, error) {
 }
 
 func (d *database) SetKey(key string, val interface{}) error {
-	_, err := d.db.NamedExec("insert into KeyVal (key, val) values (:key, :val)",
+	_, err := d.db.NamedExec("INSERT or replace INTO KeyVal (key, val) values (:key, :val)",
 		map[string]interface{}{
 			"key": key,
 			"val": val,

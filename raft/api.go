@@ -32,7 +32,10 @@ func (s *State) StartServer() {
 }
 
 func (s *State) HandleAppendEntries(w http.ResponseWriter, req *http.Request) {
-	clog.Debugf("[!] append entries")
+    var responseJson []byte
+    defer func() {
+        clog.Debugf("[!] handle append entries: %v", string(responseJson))
+    }()
 
 	args := AppendEntriesArgs{}
 	err := json.NewDecoder(req.Body).Decode(&args)
@@ -49,7 +52,7 @@ func (s *State) HandleAppendEntries(w http.ResponseWriter, req *http.Request) {
 		Success: ok,
 	}
 
-	responseJson, err := json.Marshal(resp)
+	responseJson, err = json.Marshal(resp)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
@@ -62,7 +65,11 @@ type RequestVoteResponse struct {
 }
 
 func (s *State) HandleRequestVote(w http.ResponseWriter, req *http.Request) {
-	clog.Debugf("[!] request vote")
+
+    var responseJson []byte
+    defer func() {
+        clog.Debugf("[!] handle request vote: %v", string(responseJson))
+    }()
 
 	args := RequestVoteArgs{}
 
@@ -80,7 +87,7 @@ func (s *State) HandleRequestVote(w http.ResponseWriter, req *http.Request) {
 		VoteGranted: ok,
 	}
 
-	responseJson, err := json.Marshal(resp)
+	responseJson, err = json.Marshal(resp)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
@@ -88,7 +95,7 @@ func (s *State) HandleRequestVote(w http.ResponseWriter, req *http.Request) {
 }
 
 func (s *State) SendAppendEntries(target Node, args *AppendEntriesArgs) (*AppendEntriesResponse, error) {
-	clog.Debugf("[>>] send append entries")
+	// clog.Debugf("[>>] send append entries")
 	// TODO: impl retry mechanism
 
 	jsonBody, err := json.Marshal(args)
@@ -119,7 +126,7 @@ func (s *State) SendAppendEntries(target Node, args *AppendEntriesArgs) (*Append
 }
 
 func (s *State) SendRequestVote(target Node, args *RequestVoteArgs) (*RequestVoteResponse, error) {
-	clog.Debugf("[>>] send request vote")
+	// clog.Debugf("[>>] send request vote")
 	// TODO: impl retry mechanism
 
 	jsonBody, err := json.Marshal(args)
@@ -132,24 +139,20 @@ func (s *State) SendRequestVote(target Node, args *RequestVoteArgs) (*RequestVot
 	req.Header.Set("Content-Type", "application/json; charset=UTF-8")
 
 	if err != nil {
-		clog.Debug("wawawa")
+        clog.Debug("SendRequestVote err 1: ", err)
 		return nil, err
 	}
 
 	reqResp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		clog.Debug("wawi1")
+        clog.Debug("SendRequestVote err 2: ", err)
 		return nil, err
 	}
 
-	// content, _ := io.ReadAll(reqResp.Body)
-	//
-	// log.Debug("raw contnet", string(content))
-	//
 	resp := &RequestVoteResponse{}
 	err = json.NewDecoder(reqResp.Body).Decode(resp)
 	if err != nil {
-		clog.Debug("wawi2")
+        clog.Debug("SendRequestVote err 3: ", err)
 		return nil, err
 	}
 

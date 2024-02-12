@@ -15,6 +15,8 @@ import (
 )
 
 const RETRY_COUNT = 3
+const KEY_TERM = "term"
+const KEY_VOTEDFOR = "votedfor"
 
 var ErrAppendEntriesFail = errors.New("append failed")
 
@@ -52,45 +54,38 @@ const (
 )
 
 type State struct {
-	mode   ModeState
-	ModeMu sync.Mutex
+	lock sync.Mutex
+
+	mode ModeState
 
 	// general persistent state
 	// update before respond to rpcs
 	Term     int
-	TermMu   sync.Mutex // TODO: use mutex
 	VotedFor *Node
-	VoteMu   sync.Mutex // TODO: use mutex
-	LogsMu   sync.Mutex
 
 	// general volatile state
 	CommitIndex int
-	CommitMu    sync.Mutex // TODO: use mutex
 	LastApplied int
-	AppliedMu   sync.Mutex // TODO: use mutex
 
 	// leader's volatile state
 	// reset after elections
 
 	NextIndex  []int
-	NIndexMu   sync.Mutex // TODO: use mutex
 	MatchIndex []int
-	MIndexMu   sync.Mutex // TODO: use mutex
 
 	ApplyLogCallback func(self *State)
 
 	electionTimeout      time.Duration
-	resetElectionTimeout chan<- any
-	stopElectionTimer    chan<- any
+	resetElectionTimeout chan any
+	stopElectionTimer    chan any
 
 	heartbeatInterval      time.Duration
-	stopHeartbeatBroadcast chan<- any
+	stopHeartbeatBroadcast chan any
 
 	nodes    []Node
-	nodesMu  sync.Mutex // TODO: use mutex
 	selfNode int
 
-	db      *database
+	conn    *database
 	prevIdx int
 }
 
@@ -105,12 +100,14 @@ type NewStateArgs struct {
 var clog *log.Entry
 
 func New(db *sqlx.DB, args *NewStateArgs) *State {
-    clog = log.WithField("node", args.SelfNode)
 
-	timeoutOffset := time.Duration(rand.Intn(args.Config.ElectionTimeoutRange)) * time.Millisecond
+	clog = log.WithField("node", args.SelfNode)
+	clog.Logger.SetLevel(log.InfoLevel)
+
+	randResult := rand.Intn(args.Config.ElectionTimeoutRange)
+	timeoutOffset := time.Duration(randResult*100) * time.Millisecond
 
 	clog.Info("timout offset -> ", timeoutOffset)
-	time.Sleep(2 * time.Second)
 
 	electionTimeout := args.Config.ElectionTimeoutBase + timeoutOffset
 
@@ -128,21 +125,17 @@ func New(db *sqlx.DB, args *NewStateArgs) *State {
 		})
 	}
 
-	// TODO: update term
-	term, err := conn.GetValInt("term")
+	term, err := conn.GetValInt(KEY_TERM)
 	if err == sql.ErrNoRows {
 		term = 0
 	} else if err != nil {
 		clog.Panicf("raft: failed to get term from db: %v", err)
 	}
 
-	// TODO: update voted for
 	var votedFor *Node = nil
-	votedForAddr, _ := conn.GetValString("votedFor")
+	votedForAddr, _ := conn.GetValString(KEY_VOTEDFOR)
 
-	if err == sql.ErrNoRows {
-		votedForAddr = ""
-	} else if err != nil {
+	if err != nil && err != sql.ErrNoRows {
 		clog.Panicf("raft: failed to get votedfor from db: %v", err)
 	}
 
@@ -151,26 +144,28 @@ func New(db *sqlx.DB, args *NewStateArgs) *State {
 	}
 
 	return &State{
+
 		mode:     ModeFollower,
 		Term:     term,
 		VotedFor: votedFor,
-		LogsMu:   sync.Mutex{},
 
 		CommitIndex: -1,
 		LastApplied: -1,
 		NextIndex:   []int{},
 		MatchIndex:  []int{},
 
-		ApplyLogCallback:       args.ApplyLog,
-		electionTimeout:        electionTimeout,
-		resetElectionTimeout:   make(chan<- any),
-		stopElectionTimer:      make(chan<- any),
-		heartbeatInterval:      args.HeartbeatInterval,
-		stopHeartbeatBroadcast: make(chan<- any),
+		ApplyLogCallback:     args.ApplyLog,
+		electionTimeout:      electionTimeout,
+		resetElectionTimeout: make(chan any),
+		stopElectionTimer:    make(chan any),
+
+		heartbeatInterval: args.Config.HeartbeatInterval,
+
+		stopHeartbeatBroadcast: make(chan any),
 		nodes:                  nodes,
 		selfNode:               args.SelfNode,
 
-		db: conn,
+		conn: conn,
 	}
 }
 
@@ -190,44 +185,54 @@ type AppendEntriesArgs struct {
 
 // Not thread safe.
 func (s *State) logLength() (int, error) {
-	return s.db.LogsLength()
+	return s.conn.LogsLength()
 }
 
 // Is thread safe.
-func (s *State) startElectionTimer() (chan<- any, chan<- any) {
-	reset := make(chan any)
-	stop := make(chan any)
+func (s *State) startElectionTimer() (chan any, chan any) {
+	reset := make(chan any, 10)
+	stop := make(chan any, 10)
 
 	go func() {
+	electionLoop:
 		for {
 			select {
 			case <-stop:
-				break
+				break electionLoop
 			case <-reset:
-				// do nothing
+				log.Debugf("Resetting election timer")
 			case <-time.After(s.electionTimeout):
 				go s.ToCandidate()
 			}
 		}
+		log.Info("ELECTION STOPPED")
 	}()
 
 	return reset, stop
 }
 
 // Is thread safe.
-func (s *State) startHeartbeatBroadcaster() chan<- any {
-    clog.Info("BROADCASTING YOOOO")
-	stop := make(chan any)
+func (s *State) startHeartbeatBroadcaster() chan any {
+	clog.Debugf("BROADCASTING YOOOO %d", s.Term)
+	stop := make(chan any, 10)
 
 	go func() {
+		clog.Infof("started BROADCASTING YOO with interval: %v", s.heartbeatInterval)
+
+	broadcastLoop:
 		for {
 			select {
 			case <-stop:
-				break
+				break broadcastLoop
 			case <-time.After(s.heartbeatInterval):
-				go s.BroadcastEntries(true)
+				clog.Debug("broadcasting...")
+				err := s.BroadcastEntries()
+				if err != nil {
+					log.Errorf("broadcast failed: %v", err)
+				}
 			}
 		}
+		log.Debugf("Broadcast STOPPED")
 	}()
 
 	return stop
@@ -236,43 +241,54 @@ func (s *State) startHeartbeatBroadcaster() chan<- any {
 // invoked by leader
 // Is thread safe.
 func (s *State) AppendEntries(args AppendEntriesArgs) (int, bool) {
+
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
 	if args.Term > s.Term {
+
 		if s.mode == ModeLeader {
 			s.Term = args.Term
+
+			err := s.conn.SetKey(KEY_TERM, s.Term)
+			if err != nil {
+				clog.Panicf("raft: failed to set term from db: %v", err)
+			}
+
 			s.ToFollower()
+		}
+		s.VotedFor = nil
+		err := s.conn.SetKey(KEY_VOTEDFOR, "")
+		if err != nil {
+			clog.Panicf("raft: failed to set votedfor from db: %v", err)
 		}
 	}
 
 	s.resetElectionTimeout <- signal
-	s.LogsMu.Lock()
 
 	logLength, err := s.logLength()
 	if err != nil {
-		s.LogsMu.Unlock()
 		clog.Panicf("raft: failed to get log length")
 	}
 
 	if logLength < args.PrevLogIndex {
-		s.LogsMu.Unlock()
 		return s.Term, false
 	}
 
-	prevLog, err := s.db.GetLogByIdx(args.PrevLogIndex)
+	prevLog, err := s.conn.GetLogByIdx(args.PrevLogIndex)
 	if err != nil {
-		s.LogsMu.Unlock()
 		clog.Panicf("raft: failed to get log length: %s", err.Error())
 	}
 
-	if prevLog.Term != args.PrevLogTerm {
-		s.LogsMu.Unlock()
+	if prevLog != nil && prevLog.Term != args.PrevLogTerm {
 		return s.Term, false
 	}
 
 	if len(args.Entries) == 0 {
-		// TODO: maybe just return??
+		return s.Term, true
 	}
 
-	logs, err := s.db.ListLogs(args.PrevLogIndex+1, len(args.Entries))
+	logs, err := s.conn.ListLogs(args.PrevLogIndex+1, len(args.Entries))
 
 	deleteFrom := 0
 
@@ -283,19 +299,15 @@ func (s *State) AppendEntries(args AppendEntriesArgs) (int, bool) {
 		}
 	}
 
-	err = s.db.DeleteLogs(args.Entries[deleteFrom].Idx)
+	err = s.conn.DeleteLogs(args.Entries[deleteFrom].Idx)
 	if err != nil {
-		s.LogsMu.Unlock()
 		clog.Panicf("raft: failed to delete log: %s", err.Error())
 	}
 
-	err = s.db.InsertLogs(args.Entries[deleteFrom:])
+	err = s.conn.InsertLogs(args.Entries[deleteFrom:])
 	if err != nil {
-		s.LogsMu.Unlock()
 		clog.Panicf("raft: failed to append log: %s", err.Error())
 	}
-
-	s.LogsMu.Unlock()
 
 	if args.LeaderCommit > s.CommitIndex {
 		s.CommitIndex = min(args.LeaderCommit, s.CommitIndex)
@@ -318,24 +330,35 @@ type RequestVoteArgs struct {
 // invoked by candiates
 // Is thread safe.
 func (s *State) RequestVote(args RequestVoteArgs) (int, bool) {
+
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
 	if args.Term < s.Term {
 		return s.Term, false
 	}
 
 	s.resetElectionTimeout <- signal
-	// s.LogsMu.Lock()
 	logLength, err := s.logLength()
 	if err != nil {
 		clog.Panicf("raft: vote request failed: failed to get log length: %s", err.Error())
 	}
 	logIndex := logLength - 1
 
-	// s.LogsMu.Unlock()
-
 	grantVote := (s.VotedFor == nil || *s.VotedFor == args.CandidateId) &&
 		(args.Term >= s.Term && args.LastLogIndex >= logIndex)
 
 	s.VotedFor = &args.CandidateId
+	err = s.conn.SetKey(KEY_VOTEDFOR, s.VotedFor.Addr)
+	if err != nil {
+		clog.Panicf("raft: failed to set votedfor from db: %v", err)
+	}
+
+	s.Term = args.Term
+	err = s.conn.SetKey(KEY_TERM, s.Term)
+	if err != nil {
+		clog.Panicf("raft: failed to set term from db: %v", err)
+	}
 
 	return s.Term, grantVote
 }
@@ -348,10 +371,12 @@ func (s *State) ToFollower() {
 	select {
 	case s.stopHeartbeatBroadcast <- signal:
 		// message successfully sent
+		log.Errorf("success to stop heart beat")
 	default:
 		// message dropped, probably its closed because no thing is running
+		log.Errorf("failed to stop heart beat")
 	}
-    // close(s.stopHeartbeatBroadcast)
+	// close(s.stopHeartbeatBroadcast)
 
 	resetChan, stopChan := s.startElectionTimer()
 	s.resetElectionTimeout = resetChan
@@ -360,21 +385,30 @@ func (s *State) ToFollower() {
 
 // Is thread safe.
 func (s *State) ToCandidate() {
-	clog.Info("[+] starting election")
+
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
 	s.mode = ModeCandidate
 	s.Term += 1
 	s.VotedFor = &s.nodes[s.selfNode]
-
 	s.resetElectionTimeout <- signal
 
+	err := s.conn.SetKey(KEY_TERM, s.Term)
+	if err != nil {
+		clog.Panicf("raft: failed to set term from db: %v", err)
+	}
+
+	err = s.conn.SetKey(KEY_VOTEDFOR, s.VotedFor.Addr)
+	if err != nil {
+		clog.Panicf("raft: failed to set votedfor from db: %v", err)
+	}
+
+	clog.Info("[+] starting election with term", s.Term)
+
 	acquiredVotes := 0
-
-	s.LogsMu.Lock()
-	defer s.LogsMu.Unlock()
-
 	selfNode := s.nodes[s.selfNode]
-
-	lastLog, err := s.db.GetLastLog()
+	lastLog, err := s.conn.GetLastLog()
 
 	if err == sql.ErrNoRows {
 		lastLog = &Log{}
@@ -389,11 +423,15 @@ func (s *State) ToCandidate() {
 		LastLogTerm:  lastLog.Term,
 	}
 
-	for i, node := range s.nodes {
+	clog.Debug("requesting votes")
+
+	for i := range s.nodes {
+
+		node := s.nodes[i]
+
 		if i == s.selfNode {
 			continue
 		}
-
 		resp, err := s.SendRequestVote(node, payload)
 		if err != nil {
 			clog.Error("failed to send request vote: ", err)
@@ -404,12 +442,14 @@ func (s *State) ToCandidate() {
 			return
 		}
 		if resp.VoteGranted {
-            clog.Debug("vote acc")
+			clog.Debug("vote acc")
 			acquiredVotes += 1
 		} else {
-            clog.Debug("vote rejected")
-        }
+			clog.Debug("vote rejected")
+		}
 	}
+
+	clog.Debug("done requesting vote")
 
 	if hasMajorityVote(acquiredVotes, len(s.nodes)) {
 		s.ToLeader()
@@ -424,12 +464,22 @@ func (s *State) ToCandidate() {
 // Is thread safe.
 func (s *State) ToLeader() {
 	clog.Info("[+] is now a leader")
+
 	s.mode = ModeLeader
+
+	s.VotedFor = nil
+	err := s.conn.SetKey(KEY_VOTEDFOR, "")
+	if err != nil {
+		clog.Panicf("raft: failed to set votedfor from db: %v", err)
+	}
+
 	select {
 	case s.stopElectionTimer <- signal:
 		// message successfully sent
+		log.Errorf("success to stop election")
 	default:
 		// message dropped, probably its closed
+		log.Errorf("failed to stop election")
 	}
 	// close(s.stopElectionTimer)
 	// close(s.resetElectionTimeout)
@@ -439,9 +489,6 @@ func (s *State) ToLeader() {
 
 	s.NextIndex = make([]int, len(s.nodes))
 	s.MatchIndex = make([]int, len(s.nodes))
-
-	s.LogsMu.Lock()
-	defer s.LogsMu.Unlock()
 
 	logLength, err := s.logLength()
 	if err != nil {
@@ -457,8 +504,8 @@ func (s *State) ToLeader() {
 // GetLogs will get list of logs from memory.
 // Not thread safe.
 func (s *State) GetLogs(start int, count int) ([]Log, error) {
-	// l := s.Logs[start : start+count]
-	l, err := s.db.ListLogs(start, count)
+
+	l, err := s.conn.ListLogs(start, count)
 	if err != nil {
 		return nil, err
 	}
@@ -469,10 +516,19 @@ func hasMajorityVote(vote int, total int) bool {
 	return vote > (total - vote)
 }
 
-func (s *State) BroadcastEntries(isHeartbeat bool) error {
+func (s *State) InsertLog(l Log) error {
+	s.lock.Lock()
+	defer s.lock.Unlock()
 
-	s.LogsMu.Lock()
-	defer s.LogsMu.Unlock()
+    l.Term = s.Term
+
+	return s.conn.InsertLogs([]Log{l})
+}
+
+func (s *State) BroadcastEntries() error {
+
+	s.lock.Lock()
+	defer s.lock.Unlock()
 
 	logLength, err := s.logLength()
 	if err != nil {
@@ -480,12 +536,15 @@ func (s *State) BroadcastEntries(isHeartbeat bool) error {
 	}
 
 	leader := s.nodes[s.selfNode]
-	for i, node := range s.nodes {
+	for i := range s.nodes {
+		node := s.nodes[i]
+		log.Debugf("sending to %s", node.Addr)
 
 		if i == s.selfNode {
 			continue
 		}
 
+		log.Debug("stop 1")
 		nextIdx := s.NextIndex[i]
 		args := &AppendEntriesArgs{
 			Term:     s.Term,
@@ -498,42 +557,47 @@ func (s *State) BroadcastEntries(isHeartbeat bool) error {
 			LeaderCommit: s.CommitIndex,
 		}
 
-		for {
-			if !isHeartbeat {
-				nextIdx = s.NextIndex[i]
-				res, err := s.GetLogs(nextIdx-1, logLength-nextIdx)
-				if err != nil {
-					return err
-				}
+		log.Debug("stop 2.1")
+		nextIdx = s.NextIndex[i]
 
-				args.PrevLogTerm = res[0].Term
-				args.Entries = res[1:]
-			}
+		if logLength-nextIdx > 0 {
 
-			resp, err := s.SendAppendEntries(node, args)
+			res, err := s.GetLogs(nextIdx-1, logLength-nextIdx)
 			if err != nil {
 				return err
 			}
+			log.Debug("stop 2.5")
 
-			if resp.Term > s.Term {
-				s.ToFollower()
-				return nil
-			}
-
-			if isHeartbeat {
-				return nil
-			}
-
-			if resp.Success {
-				s.NextIndex[i] = logLength
-				s.MatchIndex[i] = logLength
-				break
-			}
-
-			s.NextIndex[i] -= 1
+			args.PrevLogTerm = res[0].Term
+			args.Entries = res[1:]
 		}
+
+		log.Debug("stop 3")
+		resp, err := s.SendAppendEntries(node, args)
+		if err != nil {
+			log.Errorf("failed to send AppendEntries to %v: %v", node, err)
+			continue
+		}
+
+		log.Debug("stop 4")
+		if resp.Term > s.Term {
+			s.ToFollower()
+			return nil
+		}
+
+		log.Debug("stop 6")
+		if resp.Success {
+			s.NextIndex[i] = logLength
+			s.MatchIndex[i] = logLength
+			continue
+		}
+
+		log.Debug("stop 7")
+		s.NextIndex[i] -= 1
+		log.Debugf("wtf")
 	}
 
+	log.Debug("stop 8")
 	maxVal := 0
 	for _, val := range s.MatchIndex {
 		if maxVal < val {
@@ -541,18 +605,23 @@ func (s *State) BroadcastEntries(isHeartbeat bool) error {
 		}
 	}
 
+	log.Debug("stop 9")
 	for val := maxVal; val > s.CommitIndex; val -= 1 {
+		log.Debug("stop 9.1")
 		if val <= s.CommitIndex {
 			continue
 		}
-		logData, err := s.db.GetLogByIdx(val)
+		logData, err := s.conn.GetLogByIdx(val)
 		if err != nil {
 			return err
 		}
-		if logData.Term != s.Term {
+
+		log.Debug("stop 9.2")
+		if logData == nil || logData.Term != s.Term {
 			continue
 		}
 
+		log.Debug("stop 9.3")
 		countTrue := 0
 		for _, val2 := range s.MatchIndex {
 			if val2 >= val {
@@ -560,6 +629,7 @@ func (s *State) BroadcastEntries(isHeartbeat bool) error {
 			}
 		}
 
+		log.Debug("stop 9.4")
 		if countTrue > (len(s.MatchIndex) - countTrue) {
 			s.CommitIndex = val
 			break
