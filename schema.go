@@ -13,20 +13,19 @@ CREATE INDEX IF NOT EXISTS index_url_full ON ShortURL(url_full);
 CREATE INDEX IF NOT EXISTS index_url_id ON ShortURL(url_id);
 
 CREATE TABLE IF NOT EXISTS Logs (
-    log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    log_idx INTEGER PRIMARY KEY,
     log_term INTEGER NOT NULL,
-    log_idx INTEGER NOT NULL,
 
 	op TEXT NOT NULL,
 	strkey TEXT NOT NULL,
 	strval TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS index_log_id ON Logs(log_id);
 CREATE INDEX IF NOT EXISTS index_log_idx ON Logs(log_idx);
 
 CREATE TABLE IF NOT EXISTS Node (
-    address TEXT NOT NULL
+    address TEXT NOT NULL,
+    rest_address TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS KeyVal (

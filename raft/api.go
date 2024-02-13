@@ -9,8 +9,8 @@ import (
 	// log "github.com/sirupsen/logrus"
 )
 
-const RequestVoteAPIPath = "/requestvote"
-const AppendEntriesAPIPath = "/appendentries"
+const RequestVoteAPIPath = "/raft/requestvote"
+const AppendEntriesAPIPath = "/raft/appendentries"
 
 type AppendEntriesResponse struct {
 	Term    int  `json:"term"`

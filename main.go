@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	netURL "net/url"
 	"sync"
@@ -24,7 +25,6 @@ var ErrDecodeID = fmt.Errorf("malformed or invalid id")
 var ErrURLTooLong = fmt.Errorf("URL is too long")
 var ErrInvalidURL = fmt.Errorf("URL in request is invalid")
 var ErrInvalidRequest = fmt.Errorf("request is invalid")
-var ErrNotFound = fmt.Errorf("entity not found")
 
 const ID_LENGHT = 8
 const MAX_URL_LENGTH = 20000
@@ -56,9 +56,17 @@ type ShortURLResponse struct {
 
 func (s *server) getHandler(w http.ResponseWriter, req *http.Request) {
 	log.Printf("[+] GET | path: %s \n", req.URL.Path)
-	w.Header().Set("Content-Type", "application/json")
 
 	// TODO: redirect if not leader
+
+	if !s.raftServer.IsLeader() {
+		target := fmt.Sprintf("http://%s%s", s.raftServer.GetLeaderAddr(), req.URL.Path)
+		http.Redirect(w, req, target, http.StatusPermanentRedirect)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+
 	if len(req.URL.Path) < 1 {
 		http.Error(w, ErrInvalidRequest.Error(), http.StatusBadRequest)
 		return
@@ -66,10 +74,9 @@ func (s *server) getHandler(w http.ResponseWriter, req *http.Request) {
 
 	url_id := req.PathValue("id")
 
-	// url_id := req.URL.Path[1:]
-	// url, err := s.GetShortURL(url_id)
 	url, err := s.db.GetShortURL(url_id)
 	if err != nil {
+        log.Errorf("rest server getshorturl 3: %s", err.Error())
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -80,19 +87,27 @@ func (s *server) getHandler(w http.ResponseWriter, req *http.Request) {
 
 func (s *server) postHandler(w http.ResponseWriter, req *http.Request) {
 	log.Printf("[+] POST | path: %s \n", req.URL.Path)
-	w.Header().Set("Content-Type", "application/json")
 
-	// TODO: redirect if not leader
+	if !s.raftServer.IsLeader() {
+		target := fmt.Sprintf("http://%s%s", s.raftServer.GetLeaderAddr(), req.URL.Path)
+		http.Redirect(w, req, target, http.StatusPermanentRedirect)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
 
 	req.ParseForm()
 	urls, ok := req.PostForm["url"]
 	if !ok || len(urls) == 0 {
 		log.Errorf("invalid request")
+
+        body, _ := io.ReadAll(req.Body)
+        log.Error("data raw: ", body)
 		http.Error(w, ErrInvalidRequest.Error(), http.StatusBadRequest)
 		return
 	}
 	url := urls[0]
-	// log.Println("url value", url)
+
 	if CheckInvalidURL && !validateURL(url) {
 		log.Errorln("invalid url")
 		http.Error(w, ErrInvalidURL.Error(), http.StatusBadRequest)
@@ -100,17 +115,15 @@ func (s *server) postHandler(w http.ResponseWriter, req *http.Request) {
 	}
 	res, err := s.CreateShortURL(url)
 	if err != nil {
+		log.Errorln("failed to create url")
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
 	storedURLId, err := s.db.GetShortURL(res)
-	if err == ErrNotFound {
-		http.Error(w, "invalid id: not found", http.StatusNotFound)
-		return
-	}
 
-	if err != nil && err != ErrNotFound {
+	if err != nil && err != sql.ErrNoRows {
+        log.Errorf("rest server getshorturl 1: %s", err.Error())
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -170,16 +183,23 @@ func (s *server) CreateShortURL(urlFull string) (string, error) {
 
 	urlId, err := s.db.GetShortURL(urlFull)
 	if err != nil && err != sql.ErrNoRows {
+        log.Errorf("rest server getshorturl 2: %s", err.Error())
 		return "", nil
 	}
 
-	if urlId != "" {
+
+    log.Infof("url result is %s", urlId)
+
+	if urlId == "" && err == sql.ErrNoRows {
 		return urlId, nil
 	}
+
+    log.Info("creating url instead...")
 
 	urlId = s.HashURL(urlFull)
 	err = s.db.InsertShortURL(urlId, urlFull)
 	if err != nil {
+        log.Errorf("rest server insertshorturl: %s", err.Error())
 		return "", err
 	}
 
@@ -189,6 +209,7 @@ func (s *server) CreateShortURL(urlFull string) (string, error) {
 		Value: urlFull,
 	})
 	if err != nil {
+        log.Errorf("rest server raft insertlog: %s", err.Error())
 		return "", err
 	}
 
@@ -292,18 +313,27 @@ func main() {
 	svr.raftServer = raftServer
 
 	go func() {
+        log.Infof("running raft on %s", cfg.Nodes[cmdArgs.Self])
 		svr.raftServer.Run()
 	}()
 
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("POST /{$}", svr.postHandler)
-	mux.HandleFunc("GET /{id}", svr.getHandler)
-	log.Println("running")
 
-	err = http.ListenAndServe(cmdArgs.RestServer, mux)
+	mux.HandleFunc("POST /", svr.postHandler)
+	mux.HandleFunc("GET /{id}", svr.getHandler)
+	log.Infof("running server on %s", cmdArgs.RestServer)
+
+	err = http.ListenAndServe(cmdArgs.RestServer, logRequest(mux))
 	if err != nil {
 		log.Panicf("short url server failed: %v", err)
 	}
 
+}
+
+func logRequest(handler http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("%s %s %s\n", r.RemoteAddr, r.Method, r.URL)
+		handler.ServeHTTP(w, r)
+	})
 }

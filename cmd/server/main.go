@@ -330,10 +330,13 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	log.Info("starting main")
 	log.SetOutput(f)
 
+	log.Info("starting main")
 	model := newModel()
 
+	log.Info("starting main")
 	p := tea.NewProgram(
 		model,
 		tea.WithAltScreen(),

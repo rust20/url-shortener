@@ -23,12 +23,11 @@ var ErrAppendEntriesFail = errors.New("append failed")
 var signal = struct{}{}
 
 type Log struct {
-	Id    int    `json:"-" db:"log_id"`
+	Idx   int    `json:"idx"  db:"log_idx"`
 	Term  int    `json:"term" db:"log_term"`
-	Idx   int    `json:"idx" db:"log_idx"`
-	Op    int    `json:"op" db:"op"`
-	Key   string `json:"key" db:"strkey"`
-	Value string `json:"val" db:"strval"`
+	Op    int    `json:"op"   db:"op"`
+	Key   string `json:"key"  db:"strkey"`
+	Value string `json:"val"  db:"strval"`
 }
 
 type NodeStatus int
@@ -41,8 +40,9 @@ const (
 
 type Node struct {
 	// ID     int
-	Addr   string `db:"address"`
-	Status NodeStatus
+	Addr     string `db:"address"`
+	RestAddr string `db:"rest_address"`
+	Status   NodeStatus
 }
 
 type ModeState int
@@ -87,6 +87,9 @@ type State struct {
 
 	conn    *database
 	prevIdx int
+
+	// leaderIdx int
+	leaderNode *Node
 }
 
 type NewStateArgs struct {
@@ -102,7 +105,10 @@ var clog *log.Entry
 func New(db *sqlx.DB, args *NewStateArgs) *State {
 
 	clog = log.WithField("node", args.SelfNode)
-	clog.Logger.SetLevel(log.InfoLevel)
+	clog.Logger.SetLevel(
+		log.InfoLevel,
+		// log.DebugLevel,
+	)
 
 	randResult := rand.Intn(args.Config.ElectionTimeoutRange)
 	timeoutOffset := time.Duration(randResult*100) * time.Millisecond
@@ -120,7 +126,8 @@ func New(db *sqlx.DB, args *NewStateArgs) *State {
 
 	for _, node := range args.Config.Nodes {
 		nodes = append(nodes, Node{
-			Addr: node.Addr,
+			Addr:     node.Addr,
+			RestAddr: node.RestAddr,
 			// Status:  ,
 		})
 	}
@@ -166,21 +173,15 @@ func New(db *sqlx.DB, args *NewStateArgs) *State {
 		selfNode:               args.SelfNode,
 
 		conn: conn,
+
+		// leaderIdx: -1,
+		leaderNode: nil,
 	}
 }
 
 func (s *State) Run() {
 	s.ToFollower()
 	s.StartServer()
-}
-
-type AppendEntriesArgs struct {
-	Term         int   `json:"term"`
-	LeaderId     Node  `json:"leader_id"`
-	PrevLogIndex int   `json:"prev_log_idx"`
-	PrevLogTerm  int   `json:"prev_log_term"`
-	Entries      []Log `json:"entries"`
-	LeaderCommit int   `json:"leader_commit"`
 }
 
 // Not thread safe.
@@ -200,12 +201,12 @@ func (s *State) startElectionTimer() (chan any, chan any) {
 			case <-stop:
 				break electionLoop
 			case <-reset:
-				log.Debugf("Resetting election timer")
+				clog.Debugf("Resetting election timer")
 			case <-time.After(s.electionTimeout):
 				go s.ToCandidate()
 			}
 		}
-		log.Info("ELECTION STOPPED")
+		clog.Info("ELECTION STOPPED")
 	}()
 
 	return reset, stop
@@ -217,7 +218,7 @@ func (s *State) startHeartbeatBroadcaster() chan any {
 	stop := make(chan any, 10)
 
 	go func() {
-		clog.Infof("started BROADCASTING YOO with interval: %v", s.heartbeatInterval)
+		clog.Debugf("started BROADCASTING with interval: %v", s.heartbeatInterval)
 
 	broadcastLoop:
 		for {
@@ -228,62 +229,89 @@ func (s *State) startHeartbeatBroadcaster() chan any {
 				clog.Debug("broadcasting...")
 				err := s.BroadcastEntries()
 				if err != nil {
-					log.Errorf("broadcast failed: %v", err)
+					clog.Errorf("broadcast failed: %v", err)
 				}
 			}
 		}
-		log.Debugf("Broadcast STOPPED")
+		clog.Debugf("Broadcast STOPPED")
 	}()
 
 	return stop
 }
 
+func (s *State) IsLeader() bool {
+	s.lock.Lock()
+	clog.Debugf("isleader hold the lock")
+	defer s.lock.Unlock()
+
+	return s.mode == ModeLeader
+}
+
+func (s *State) GetLeaderAddr() string {
+	s.lock.Lock()
+	clog.Debugf("getleaderaddr hold the lock")
+	defer s.lock.Unlock()
+
+	// return s.nodes[s.leaderIdx].Addr
+	return s.leaderNode.RestAddr
+}
+
+type AppendEntriesArgs struct {
+	Term         int   `json:"term"`
+	LeaderId     int   `json:"leader_id"`
+	PrevLogIndex int   `json:"prev_log_idx"`
+	PrevLogTerm  int   `json:"prev_log_term"`
+	Entries      []Log `json:"entries"`
+	LeaderCommit int   `json:"leader_commit"`
+}
+
 // invoked by leader
 // Is thread safe.
 func (s *State) AppendEntries(args AppendEntriesArgs) (int, bool) {
+	clog.Debug("appending entry")
 
 	s.lock.Lock()
+	clog.Debugf("appendentries hold the lock")
 	defer s.lock.Unlock()
 
+	s.resetElectionTimeout <- signal
+
+    if args.Term < s.Term {
+        return s.Term, false
+    }
+
 	if args.Term > s.Term {
+		s.Term = args.Term
 
-		if s.mode == ModeLeader {
-			s.Term = args.Term
-
-			err := s.conn.SetKey(KEY_TERM, s.Term)
-			if err != nil {
-				clog.Panicf("raft: failed to set term from db: %v", err)
-			}
-
-			s.ToFollower()
+		err := s.conn.SetKey(KEY_TERM, s.Term)
+		if err != nil {
+			clog.Panicf("raft: failed to set term from db: %v", err)
 		}
+
+		s.ToFollower()
+		clog.Debug("setting new id to ", args.LeaderId)
+
+		s.leaderNode = &s.nodes[args.LeaderId]
+
 		s.VotedFor = nil
-		err := s.conn.SetKey(KEY_VOTEDFOR, "")
+		err = s.conn.SetKey(KEY_VOTEDFOR, "")
 		if err != nil {
 			clog.Panicf("raft: failed to set votedfor from db: %v", err)
 		}
 	}
 
-	s.resetElectionTimeout <- signal
-
-	logLength, err := s.logLength()
-	if err != nil {
-		clog.Panicf("raft: failed to get log length")
-	}
-
-	if logLength < args.PrevLogIndex {
-		return s.Term, false
-	}
 
 	prevLog, err := s.conn.GetLogByIdx(args.PrevLogIndex)
 	if err != nil {
 		clog.Panicf("raft: failed to get log length: %s", err.Error())
 	}
 
-	if prevLog != nil && prevLog.Term != args.PrevLogTerm {
+    // check for conflict
+	if prevLog == nil || prevLog.Term != args.PrevLogTerm {
 		return s.Term, false
 	}
 
+    // return early if there's no entry to append
 	if len(args.Entries) == 0 {
 		return s.Term, true
 	}
@@ -332,6 +360,7 @@ type RequestVoteArgs struct {
 func (s *State) RequestVote(args RequestVoteArgs) (int, bool) {
 
 	s.lock.Lock()
+	clog.Debugf("requestvote hold the lock")
 	defer s.lock.Unlock()
 
 	if args.Term < s.Term {
@@ -349,10 +378,13 @@ func (s *State) RequestVote(args RequestVoteArgs) (int, bool) {
 		(args.Term >= s.Term && args.LastLogIndex >= logIndex)
 
 	s.VotedFor = &args.CandidateId
+    clog.Infof("voted for %s", s.VotedFor.Addr)
 	err = s.conn.SetKey(KEY_VOTEDFOR, s.VotedFor.Addr)
 	if err != nil {
 		clog.Panicf("raft: failed to set votedfor from db: %v", err)
 	}
+
+	s.leaderNode = &args.CandidateId
 
 	s.Term = args.Term
 	err = s.conn.SetKey(KEY_TERM, s.Term)
@@ -371,10 +403,10 @@ func (s *State) ToFollower() {
 	select {
 	case s.stopHeartbeatBroadcast <- signal:
 		// message successfully sent
-		log.Errorf("success to stop heart beat")
+		clog.Errorf("success to stop heart beat")
 	default:
 		// message dropped, probably its closed because no thing is running
-		log.Errorf("failed to stop heart beat")
+		clog.Errorf("failed to stop heart beat")
 	}
 	// close(s.stopHeartbeatBroadcast)
 
@@ -385,8 +417,10 @@ func (s *State) ToFollower() {
 
 // Is thread safe.
 func (s *State) ToCandidate() {
+	clog.Info("is now a candidate")
 
 	s.lock.Lock()
+	clog.Debugf("tocandidate hold the lock")
 	defer s.lock.Unlock()
 
 	s.mode = ModeCandidate
@@ -394,11 +428,15 @@ func (s *State) ToCandidate() {
 	s.VotedFor = &s.nodes[s.selfNode]
 	s.resetElectionTimeout <- signal
 
+	clog.Debugf("setting term")
+
 	err := s.conn.SetKey(KEY_TERM, s.Term)
 	if err != nil {
 		clog.Panicf("raft: failed to set term from db: %v", err)
 	}
 
+    clog.Infof("voted for %s", s.VotedFor.Addr)
+	clog.Debugf("setting votedfor")
 	err = s.conn.SetKey(KEY_VOTEDFOR, s.VotedFor.Addr)
 	if err != nil {
 		clog.Panicf("raft: failed to set votedfor from db: %v", err)
@@ -410,8 +448,11 @@ func (s *State) ToCandidate() {
 	selfNode := s.nodes[s.selfNode]
 	lastLog, err := s.conn.GetLastLog()
 
-	if err == sql.ErrNoRows {
-		lastLog = &Log{}
+	if err == sql.ErrNoRows || (lastLog == nil && err == nil) {
+		lastLog = &Log{
+			Idx:  -1,
+			Term: s.Term,
+		}
 	} else if err != nil {
 		clog.Panicf("raft: candidate process failed: failed to get log length: %s", err.Error())
 	}
@@ -428,17 +469,22 @@ func (s *State) ToCandidate() {
 	for i := range s.nodes {
 
 		node := s.nodes[i]
+		clog.Debugf("send request to node %d", i)
 
 		if i == s.selfNode {
 			continue
 		}
+		clog.Debugf("not self node")
 		resp, err := s.SendRequestVote(node, payload)
 		if err != nil {
 			clog.Error("failed to send request vote: ", err)
 			continue
 		}
+		clog.Debugf("done send")
 		if resp.Term > s.Term {
 			s.ToFollower()
+			// s.leaderIdx = i
+			s.leaderNode = &s.nodes[i]
 			return
 		}
 		if resp.VoteGranted {
@@ -476,10 +522,10 @@ func (s *State) ToLeader() {
 	select {
 	case s.stopElectionTimer <- signal:
 		// message successfully sent
-		log.Errorf("success to stop election")
+		clog.Errorf("successfully stop election timer")
 	default:
 		// message dropped, probably its closed
-		log.Errorf("failed to stop election")
+		clog.Errorf("failed to stop election timer")
 	}
 	// close(s.stopElectionTimer)
 	// close(s.resetElectionTimeout)
@@ -518,9 +564,10 @@ func hasMajorityVote(vote int, total int) bool {
 
 func (s *State) InsertLog(l Log) error {
 	s.lock.Lock()
+	clog.Debugf("insertlog hold the lock")
 	defer s.lock.Unlock()
 
-    l.Term = s.Term
+	l.Term = s.Term
 
 	return s.conn.InsertLogs([]Log{l})
 }
@@ -528,6 +575,7 @@ func (s *State) InsertLog(l Log) error {
 func (s *State) BroadcastEntries() error {
 
 	s.lock.Lock()
+	clog.Debugf("broadcastentry hold the lock")
 	defer s.lock.Unlock()
 
 	logLength, err := s.logLength()
@@ -535,20 +583,19 @@ func (s *State) BroadcastEntries() error {
 		return fmt.Errorf("raft: broadcast entries failed: failed to get log length: %s", err.Error())
 	}
 
-	leader := s.nodes[s.selfNode]
 	for i := range s.nodes {
 		node := s.nodes[i]
-		log.Debugf("sending to %s", node.Addr)
+		clog.Debugf("sending to %s", node.Addr)
 
 		if i == s.selfNode {
 			continue
 		}
 
-		log.Debug("stop 1")
+		clog.Debug("stop 1")
 		nextIdx := s.NextIndex[i]
 		args := &AppendEntriesArgs{
 			Term:     s.Term,
-			LeaderId: leader,
+			LeaderId: s.selfNode,
 
 			PrevLogIndex: nextIdx - 1,
 			PrevLogTerm:  0,
@@ -557,7 +604,7 @@ func (s *State) BroadcastEntries() error {
 			LeaderCommit: s.CommitIndex,
 		}
 
-		log.Debug("stop 2.1")
+		clog.Debug("stop 2.1")
 		nextIdx = s.NextIndex[i]
 
 		if logLength-nextIdx > 0 {
@@ -566,38 +613,51 @@ func (s *State) BroadcastEntries() error {
 			if err != nil {
 				return err
 			}
-			log.Debug("stop 2.5")
+
+			clog.Infof("get log param: %d %d %d %d",
+				nextIdx-1,
+				logLength-nextIdx,
+				nextIdx,
+				logLength,
+			)
+			clog.Debug("stop 2.5")
 
 			args.PrevLogTerm = res[0].Term
 			args.Entries = res[1:]
+		} else {
+			args.PrevLogTerm = s.Term
+			args.Entries = []Log{}
 		}
 
-		log.Debug("stop 3")
+		clog.Debug("stop 3")
 		resp, err := s.SendAppendEntries(node, args)
 		if err != nil {
-			log.Errorf("failed to send AppendEntries to %v: %v", node, err)
+			clog.Errorf("failed to send AppendEntries to %v: %v", node, err)
 			continue
 		}
 
-		log.Debug("stop 4")
+		clog.Debug("stop 4")
 		if resp.Term > s.Term {
 			s.ToFollower()
+			s.leaderNode = &s.nodes[i]
 			return nil
 		}
 
-		log.Debug("stop 6")
+		clog.Debug("stop 6")
 		if resp.Success {
 			s.NextIndex[i] = logLength
 			s.MatchIndex[i] = logLength
 			continue
 		}
 
-		log.Debug("stop 7")
-		s.NextIndex[i] -= 1
-		log.Debugf("wtf")
+		clog.Debug("stop 7")
+        if s.NextIndex[i] > 0 {
+            s.NextIndex[i] -= 1
+        }
+		clog.Debugf("wtf")
 	}
 
-	log.Debug("stop 8")
+	clog.Debug("stop 8")
 	maxVal := 0
 	for _, val := range s.MatchIndex {
 		if maxVal < val {
@@ -605,9 +665,9 @@ func (s *State) BroadcastEntries() error {
 		}
 	}
 
-	log.Debug("stop 9")
+	clog.Debug("stop 9")
 	for val := maxVal; val > s.CommitIndex; val -= 1 {
-		log.Debug("stop 9.1")
+		clog.Debug("stop 9.1")
 		if val <= s.CommitIndex {
 			continue
 		}
@@ -616,12 +676,12 @@ func (s *State) BroadcastEntries() error {
 			return err
 		}
 
-		log.Debug("stop 9.2")
+		clog.Debug("stop 9.2")
 		if logData == nil || logData.Term != s.Term {
 			continue
 		}
 
-		log.Debug("stop 9.3")
+		clog.Debug("stop 9.3")
 		countTrue := 0
 		for _, val2 := range s.MatchIndex {
 			if val2 >= val {
@@ -629,7 +689,7 @@ func (s *State) BroadcastEntries() error {
 			}
 		}
 
-		log.Debug("stop 9.4")
+		clog.Debug("stop 9.4")
 		if countTrue > (len(s.MatchIndex) - countTrue) {
 			s.CommitIndex = val
 			break

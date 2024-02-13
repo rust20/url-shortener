@@ -1,17 +1,22 @@
 Nodes:
   - Name: "node1"
     Addr: "localhost:8000"
+    RestAddr: "localhost:8080"
   - Name: "node2"
     Addr: "localhost:8001"
+    RestAddr: "localhost:8081"
   - Name: "node3"
     Addr: "localhost:8002"
+    RestAddr: "localhost:8082"
   - Name: "node4"
     Addr: "localhost:8003"
+    RestAddr: "localhost:8083"
   - Name: "node5"
     Addr: "localhost:8004"
+    RestAddr: "localhost:8084"
 
 HeartbeatInterval: "500ms"
-ElectionTimeoutBase: "2000ms"
-ElectionTimeoutRange: 10
+ElectionTimeoutBase: "4000ms"
+ElectionTimeoutRange: 20
 DBFileName: "database.sqlite3"
 ServerPort: "8080"

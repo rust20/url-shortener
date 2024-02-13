@@ -8,15 +8,16 @@ import (
 )
 
 type ServerConfig struct {
-	Name string
-	Addr string
+	Name     string
+	Addr     string
+	RestAddr string
 }
 
 type Config struct {
 	// CurrentNode
 	Nodes []ServerConfig
 
-	Self ServerConfig
+	// Self ServerConfig
 
 	HeartbeatInterval    time.Duration
 	ElectionTimeoutBase  time.Duration
@@ -24,8 +25,8 @@ type Config struct {
 
 	DBFileName string
 
-    RaftServePort string
-    RestServePort string
+	RaftServePort string
+	RestServePort string
 }
 
 func GetConfig(configName string) Config {
@@ -35,13 +36,13 @@ func GetConfig(configName string) Config {
 
 	// viper.AddConfigPath("/etc/appname/")  // path to look for the config file in
 	// viper.AddConfigPath("$HOME/.appname") // call multiple times to add many search paths
-    viper.SetDefault("RaftServePort", ":1337")
-    viper.SetDefault("RestServePort", ":8080")
+	viper.SetDefault("RaftServePort", ":1337")
+	viper.SetDefault("RestServePort", ":8080")
 
 	viper.AddConfigPath(".")    // optionally look for config in the working directory
 	err := viper.ReadInConfig() // Find and read the config file
 	if err != nil {             // Handle errors reading the config file
-        log.Panicf("fatal error config file: %v", err)
+		log.Panicf("fatal error config file: %v", err)
 	}
 
 	cfg := &Config{}
@@ -50,7 +51,7 @@ func GetConfig(configName string) Config {
 		log.Panicf("unable to decode into struct, %v", err)
 	}
 
-    // log.Info(cfg)
+	// log.Info(cfg)
 
 	return *cfg
 }

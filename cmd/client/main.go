@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,11 +15,13 @@ import (
 )
 
 const clickbenchUrl = "https://db.in.tum.de/teaching/ws2324/clouddataprocessing/data/filelist.csv"
-const limitdataset = 3
+const offsetdataset = 0
+const limitdataset = 170
 
 type client struct {
 	host string
 	port string
+    httpClient *http.Client
 }
 type ShortURLResponse struct {
 	Status   int32  `json:"status"`
@@ -34,34 +37,32 @@ func (c *client) CreateURL(url_data string) (string, error) {
 	form.Add("url", url_data)
 
 	targetURL := fmt.Sprintf("http://%s:%s%s", c.host, c.port, "/")
-	req, err := http.NewRequest(http.MethodPost, targetURL, strings.NewReader(form.Encode()))
 
+    reqResp, err := c.httpClient.Post(targetURL, "application/x-www-form-urlencoded", strings.NewReader(form.Encode()))
 	if err != nil {
+		log.Info("fail here")
 		return "", err
 	}
 
-	// req.PostForm = form
-	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
-
-	reqResp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", err
-	}
+    log.Info("statuscode: ", reqResp.Status)
 
 	if reqResp.StatusCode != http.StatusOK {
 
-        body, err := io.ReadAll(reqResp.Body)
-        if err != nil {
-            log.Fatal(err)
-        }
+		body, err := io.ReadAll(reqResp.Body)
+		if err != nil {
+            log.Info("fail here 2")
+			log.Fatal(err)
+		}
 
-        log.Error("status", reqResp.Status, "content:", string(body))
-        return "", fmt.Errorf("request failed")
+        log.Info("fail here 3")
+		log.Error("status", reqResp.Status, "content:", string(body))
+		return "", fmt.Errorf("request failed, status %s", reqResp.Status)
 	}
 
 	resp := &ShortURLResponse{}
 	err = json.NewDecoder(reqResp.Body).Decode(resp)
 	if err != nil {
+        log.Info("fail here 4")
 		return "", err
 	}
 
@@ -72,10 +73,13 @@ func try_single() {
 	c := client{
 		host: "localhost",
 		port: "8080",
+        httpClient: &http.Client{
+            CheckRedirect: redirectPostOn302,
+        },
 	}
 
 	url_data := "http:%2F%2Fwwww.diary.ru/yandsearch?type=topics&lang=ru&cE=true&uA=Mozilnik.ru%2Fslovarenok.ru/GameMain.aspx&ei=LuzTUdyMAl2tPbUfb8EeS34ASWs4GADQ&usg=AFQjCNERpbuvboma-skaDw&sig=e893e60d43a06fadaachki/default8909644&source=web&cd=7&ved=0CEEQFjAI&url=http://yandsearch&input_age2=&input_vip=&int[60][2021&redir=1&limited 4 black.ru/name=yandex.ru/sell/204254&ELEMENT&room=1&d1=01.08.2013&text=смотреть онлайн  берем дженер&dated/vamp/LaRedouters=0&po_yers=2000/currency=RUR/heating=1/page2/?er=2&target=search/price_do=30000&curre/list.html?act=Longitude=600086105/Adobe-gorod/page12/page5/?elmt=137309gasHIpq_TygcJAtIp-JFwwnYCIDg&usg=AFQjCNG9M0QsxqqdKXc28T5____GN1O1Kg==&y1=2012 серии подборщик/hasimages=1/feerie.com.ua/search&evL8b-gh_masljan-paltor=&o=0&wi=1280&u_tz=0&auto.ria.ua/?target=search?q=пантены в лав и ижевской животными&t=web&cd=3&car=0&auto.ria.ua/search?clid=137062126969077806]=Y&SelectedRegion/vacuumewgAEAEAcLa4ATD8IDYBA&usg=AFQjCNHu347logout&lr=172&text=народный район страция потолока на эстоны с фото&rid=213&text=AdeletedAuto=oldAuto=oldAutos&marka=58&dep_id=9403&lr=2013-07-18&num=11&category=RUR/rebtLong=0/pageTypeSearch_user%2F46537597&lr=54&text=мчс&l=&sort=PRICE][from]=&int[21633961320/?item_no=39750&sale/viewforum/MsgList.php?g=1280&state/component/search.xml?from]=&int[9][from=yandex.ru/shosseTypeSearch/?tab=&page6/#overinki-i-net.ru/imgres?img=arminatsja-doma.ru/mileonbet-krasnodar.irr.ru/index.ru/search?clid=1372868][from]=46510&lr=21000007.msg68364%26oe%3D30000&currency=RUR/sort=newly&sle=4&streal-estate_id=0&input_who1=2&input_who1=2&input_sponsor=&o=3000.ru/chelov.ru/showall=от 5000f.html?page=2&q=прода&oq=перевод&clid=440724-81 скачать чук (непрохождения  свария боротки смотреть фильм складывать газин&newFlat=0&newwindows-1251&lr=1423920/trashbox.ru/otdam-darom/pink/frontakty_zadness/businskaia-moda-zhienskaia"
-    log.Info("data length:", len(url_data))
+	log.Info("data length:", len(url_data))
 
 	res, err := c.CreateURL(url_data)
 	if err != nil {
@@ -89,6 +93,9 @@ func try_many() {
 	c := client{
 		host: "localhost",
 		port: "8080",
+        httpClient: &http.Client{
+            CheckRedirect: redirectPostOn302,
+        },
 	}
 
 	resDataSet, err := http.Get(clickbenchUrl)
@@ -101,7 +108,7 @@ func try_many() {
 		log.Fatal("parse csv dataset fail", err)
 	}
 
-	for _, data := range dataSet[:limitdataset] {
+	for _, data := range dataSet[offsetdataset:limitdataset] {
 		log.Info(data)
 
 		res, err := http.Get(data[0])
@@ -116,7 +123,7 @@ func try_many() {
 			log.Fatal("parse csv partial dataset fail", err)
 		}
 
-        total := len(dataContent)
+		total := len(dataContent)
 		for i, row := range dataContent {
 			url_data := row[1]
 
@@ -125,11 +132,11 @@ func try_many() {
 				log.Fatalf("request failed: %s", err)
 			}
 
-            if i % 1000 == 0 {
-                log.Infof("prog: %v/%v", i, total)
-            }
+			if i%1000 == 0 {
+				log.Infof("prog: %v/%v", i, total)
+			}
 
-            log.Debugf("url: %s | result: %s", url_data, res)
+			log.Debugf("url: %s | result: %s", url_data, res)
 		}
 	}
 
@@ -140,8 +147,31 @@ func try_many() {
 	// send payload
 }
 
+func redirectPostOn302(req *http.Request, via []*http.Request) error {
+    if len(via) >= 10 {
+        return errors.New("stopped after 10 redirects")
+    }
+
+    lastReq := via[len(via)-1]
+    if req.Response.StatusCode == 302 && lastReq.Method == http.MethodPost {
+        req.Method = http.MethodPost
+
+        // Get the body of the original request, set here, since req.Body will be nil if a 302 was returned
+        if via[0].GetBody != nil {
+            var err error
+            req.Body, err = via[0].GetBody()
+            if err != nil {
+                return err
+            }
+            req.ContentLength = via[0].ContentLength
+        }
+    }
+
+    return nil
+}
+
 func main() {
-    log.SetLevel(log.InfoLevel)
+	log.SetLevel(log.InfoLevel)
 	// try_single()
 	try_many()
 }

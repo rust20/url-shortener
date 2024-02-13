@@ -1,6 +1,8 @@
 package main
 
 import (
+	"database/sql"
+
 	"github.com/jmoiron/sqlx"
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -37,7 +39,7 @@ func (d *database) GetShortURL(url_id string) (string, error) {
 	}
 
 	if len(result) < 1 {
-		return "", ErrNotFound
+		return "", sql.ErrNoRows
 	}
 
 	return result[0], nil

@@ -38,11 +38,15 @@ func (d *database) InsertLogs(logs []Log) error {
 		return err
 	}
 
+	nextId := count
+
 	query := "" +
-		"INSERT INTO Node(log_id, log_term, log_idx, op, strkey, strval) " +
-		"values(:idx, :term, :idx, :opr, :key, :val)"
+		"INSERT INTO Logs(log_idx, log_term, op, strkey, strval) " +
+		"values(:idx, :term, :opr, :key, :val)"
 
 	for _, log := range logs {
+		log.Idx = nextId
+		nextId += 1
 		result, err := tx.NamedExec(query,
 			map[string]interface{}{
 				"idx":  log.Idx,
@@ -93,7 +97,7 @@ func (d *database) ListLogs(indexStart int, count int) ([]Log, error) {
 	result := []Log{}
 	err := d.db.Select(
 		&result,
-		"SELECT * FROM Logs WHERE log_idx > ? LIMIT ?",
+		"SELECT * FROM Logs WHERE log_idx >= ? LIMIT ?",
 		indexStart,
 		count,
 	)
@@ -104,6 +108,9 @@ func (d *database) ListLogs(indexStart int, count int) ([]Log, error) {
 }
 
 func (d *database) GetLogByIdx(idx int) (*Log, error) {
+    if idx < 0 {
+        return nil, nil
+    }
 	res, err := d.ListLogs(idx, 1)
 	if err != nil {
 		return nil, err
@@ -132,7 +139,7 @@ func (d *database) GetLastLog() (*Log, error) {
 }
 
 func (d *database) DeleteLogs(idx int) error {
-	_, err := d.db.Exec("DELETE FROM Logs WHERE log_id >= ?",
+	_, err := d.db.Exec("DELETE FROM Logs WHERE log_idx >= ?",
 		idx)
 	if err != nil {
 		return err
